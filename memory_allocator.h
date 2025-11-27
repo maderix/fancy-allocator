@@ -14,6 +14,34 @@
 #include <chrono>
 #include <sched.h>     // sched_yield
 #include <sys/mman.h>  // mmap, munmap, madvise
+#include <unordered_set>
+#include <unordered_map>
+#include <cstdio>      // fprintf for debug output
+
+//-------------------------------------------------------
+// Debug/Safety Configuration
+// Compile with -DFANCY_DEBUG to enable all safety checks
+// Compile with -DFANCY_DEBUG_VERBOSE for detailed logging
+//-------------------------------------------------------
+#ifdef FANCY_DEBUG
+    #define FANCY_CANARY_CHECK 1      // Buffer overflow detection
+    #define FANCY_POISON_CHECK 1      // Use-after-free detection
+    #define FANCY_DOUBLE_FREE_CHECK 1 // Double-free detection
+    #define FANCY_STATS_DETAILED 1    // Per-bin statistics
+    #define FANCY_STATS_ENABLED 1     // Basic stats in hot path
+#else
+    #define FANCY_CANARY_CHECK 0
+    #define FANCY_POISON_CHECK 0
+    #define FANCY_DOUBLE_FREE_CHECK 0
+    #define FANCY_STATS_DETAILED 0
+    #define FANCY_STATS_ENABLED 0     // No stats overhead in release
+#endif
+
+// Debug constants
+static constexpr uint32_t CANARY_VALUE = 0xDEADCAFE;     // Buffer overflow canary
+static constexpr uint32_t POISON_FREED = 0xFEEDFACE;    // Freed memory poison
+static constexpr uint32_t POISON_UNINIT = 0xBAADF00D;   // Uninitialized memory
+static constexpr size_t   FREED_TRACKER_SIZE = 16384;   // Track last N freed pointers
 
 //-------------------------------------------------------
 // Memory allocation helpers using mmap for better performance
@@ -84,13 +112,89 @@ public:
 };
 
 //-------------------------------------------------------
-// 1) Stats
+// 1) Stats - Basic and Detailed
 //-------------------------------------------------------
 struct AllocStatsSnapshot {
     size_t totalAllocCalls;
     size_t totalFreeCalls;
     size_t currentUsedBytes;
     size_t peakUsedBytes;
+};
+
+// Detailed per-bin statistics (enabled with FANCY_DEBUG)
+struct DetailedStatsSnapshot {
+    AllocStatsSnapshot basic;
+
+    // Per-bin stats (small allocations)
+    size_t smallBinAllocCounts[16];
+    size_t smallBinFreeCounts[16];
+    size_t smallBinCurrentCount[16];
+
+    // Per-bin stats (large allocations)
+    size_t largeBinAllocCounts[16];
+    size_t largeBinFreeCounts[16];
+    size_t largeBinCurrentCount[16];
+
+    // Fragmentation metrics
+    size_t totalArenaBytes;        // Total arena memory
+    size_t usedArenaBytes;         // Actually used memory
+    size_t freeBlockCount;         // Number of free blocks
+    size_t largestFreeBlock;       // Largest contiguous free block
+    double fragmentationRatio;     // 1.0 - (largest / total_free)
+
+    // Safety check stats
+    size_t doubleFreeAttempts;
+    size_t bufferOverflowsDetected;
+    size_t useAfterFreeDetected;
+    size_t corruptedBlocksDetected;
+
+    void print() const {
+        fprintf(stderr, "\n=== FancyAllocator Detailed Stats ===\n");
+        fprintf(stderr, "Total alloc calls:    %zu\n", basic.totalAllocCalls);
+        fprintf(stderr, "Total free calls:     %zu\n", basic.totalFreeCalls);
+        fprintf(stderr, "Current used bytes:   %zu\n", basic.currentUsedBytes);
+        fprintf(stderr, "Peak used bytes:      %zu\n", basic.peakUsedBytes);
+
+        fprintf(stderr, "\n--- Small Bin Stats (<=512B) ---\n");
+        const size_t smallSizes[] = {16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512};
+        for (int i = 0; i < 16; i++) {
+            if (smallBinAllocCounts[i] > 0) {
+                fprintf(stderr, "  Bin %2d (%3zuB): allocs=%zu, frees=%zu, live=%zu\n",
+                       i, smallSizes[i], smallBinAllocCounts[i], smallBinFreeCounts[i], smallBinCurrentCount[i]);
+            }
+        }
+
+        fprintf(stderr, "\n--- Large Bin Stats (>512B) ---\n");
+        const char* largeSizeNames[] = {"1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K",
+                                        "256K", "512K", "1M", "2M", "4M", "8M", "16M", "huge"};
+        for (int i = 0; i < 16; i++) {
+            if (largeBinAllocCounts[i] > 0) {
+                fprintf(stderr, "  Bin %2d (%s): allocs=%zu, frees=%zu, live=%zu\n",
+                       i, largeSizeNames[i], largeBinAllocCounts[i], largeBinFreeCounts[i], largeBinCurrentCount[i]);
+            }
+        }
+
+        fprintf(stderr, "\n--- Fragmentation ---\n");
+        fprintf(stderr, "Total arena bytes:    %zu\n", totalArenaBytes);
+        fprintf(stderr, "Used arena bytes:     %zu\n", usedArenaBytes);
+        fprintf(stderr, "Free block count:     %zu\n", freeBlockCount);
+        fprintf(stderr, "Largest free block:   %zu\n", largestFreeBlock);
+        fprintf(stderr, "Fragmentation ratio:  %.2f%%\n", fragmentationRatio * 100.0);
+
+        if (doubleFreeAttempts > 0 || bufferOverflowsDetected > 0 ||
+            useAfterFreeDetected > 0 || corruptedBlocksDetected > 0) {
+            fprintf(stderr, "\n--- SAFETY VIOLATIONS ---\n");
+            if (doubleFreeAttempts > 0)
+                fprintf(stderr, "  Double-free attempts:    %zu\n", doubleFreeAttempts);
+            if (bufferOverflowsDetected > 0)
+                fprintf(stderr, "  Buffer overflows:        %zu\n", bufferOverflowsDetected);
+            if (useAfterFreeDetected > 0)
+                fprintf(stderr, "  Use-after-free:          %zu\n", useAfterFreeDetected);
+            if (corruptedBlocksDetected > 0)
+                fprintf(stderr, "  Corrupted blocks:        %zu\n", corruptedBlocksDetected);
+        }
+        fprintf(stderr, "=====================================\n\n");
+    }
 };
 
 // Cache-line aligned to prevent false sharing between cores
@@ -103,6 +207,20 @@ struct alignas(64) AllocStats {
     char pad3[64 - sizeof(std::atomic<size_t>)];
     std::atomic<size_t> peakUsedBytes{0};
     char pad4[64 - sizeof(std::atomic<size_t>)];
+
+#if FANCY_STATS_DETAILED
+    // Per-bin statistics (only in debug mode)
+    std::atomic<size_t> smallBinAllocs[16] = {};
+    std::atomic<size_t> smallBinFrees[16] = {};
+    std::atomic<size_t> largeBinAllocs[16] = {};
+    std::atomic<size_t> largeBinFrees[16] = {};
+
+    // Safety violation counters
+    std::atomic<size_t> doubleFreeAttempts{0};
+    std::atomic<size_t> bufferOverflows{0};
+    std::atomic<size_t> useAfterFree{0};
+    std::atomic<size_t> corruptedBlocks{0};
+#endif
 
     AllocStatsSnapshot snapshot() const {
         AllocStatsSnapshot snap;
@@ -126,13 +244,29 @@ static constexpr size_t SMALL_BIN_SIZE[SMALL_BIN_COUNT] = {
 };
 static constexpr size_t MAX_SMALL_SIZE = 512;
 
-struct SmallBlockHeader {
-    size_t binIndex;
-    size_t userSize;
+// Magic for small block headers (different from Arena::MAGIC)
+// Reduced to 16-bit for smaller header
+static constexpr uint16_t SMALL_MAGIC = 0xFACE;
+
+// Minimal header: 8 bytes (aligned) in release, 16 bytes in debug
+struct alignas(8) SmallBlockHeader {
+    uint16_t magic;       // 2 bytes - Always SMALL_MAGIC
+    uint8_t binIndex;     // 1 byte  - 0-15 bins (max 255)
+    uint8_t flags;        // 1 byte  - Reserved for future use
+    uint32_t padding;     // 4 bytes - Align to 8 bytes for pointer storage
+#if FANCY_CANARY_CHECK
+    uint32_t userSize;    // 4 bytes - Only needed for canary position
+    uint32_t canaryHead;  // 4 bytes - Canary at start (checked for corruption)
+#endif
 };
 struct SmallFreeBlock {
     SmallBlockHeader hdr;
     SmallFreeBlock* next;
+};
+
+// Canary trailer for buffer overflow detection (placed after user data)
+struct SmallBlockTrailer {
+    uint32_t canaryTail;
 };
 
 // O(1) size-to-bin lookup - use bit manipulation directly
@@ -167,6 +301,10 @@ public:
         localFreeCalls_ = 0;
         localBytesAllocated_ = 0;
         localBytesFreed_ = 0;
+#if FANCY_DOUBLE_FREE_CHECK
+        freedTrackerIdx_ = 0;
+        std::memset(freedTracker_, 0, sizeof(freedTracker_));
+#endif
     }
     ~ThreadLocalSmallCache() {
         // Note: slabs are leaked for simplicity (or could track and munmap)
@@ -196,29 +334,104 @@ public:
         return fastFindSmallBin(size);
     }
 
+#if FANCY_DOUBLE_FREE_CHECK
+    bool isRecentlyFreed(void* ptr) {
+        for (size_t i = 0; i < FREED_TRACKER_SIZE; i++) {
+            if (freedTracker_[i] == ptr) return true;
+        }
+        return false;
+    }
+
+    void trackFreed(void* ptr) {
+        freedTracker_[freedTrackerIdx_] = ptr;
+        freedTrackerIdx_ = (freedTrackerIdx_ + 1) % FREED_TRACKER_SIZE;
+    }
+
+    void untrackFreed(void* ptr) {
+        for (size_t i = 0; i < FREED_TRACKER_SIZE; i++) {
+            if (freedTracker_[i] == ptr) {
+                freedTracker_[i] = nullptr;
+                return;
+            }
+        }
+    }
+#endif
+
     __attribute__((always_inline, hot))
     void* allocateSmall(size_t reqSize, AllocStats& stats) {
         int bin = findBin(reqSize);
         if (__builtin_expect(bin < 0, 0)) return nullptr;
 
-        SmallFreeBlock* head = freeList_[bin];
+        void* userPtr = nullptr;
+        char* block = freeList_[bin];
 
-        // Fast path: pop from free list (most common case)
-        if (__builtin_expect(head != nullptr, 1)) {
-            freeList_[bin] = head->next;
-            head->hdr.userSize = reqSize;
-            // Prefetch next block for future alloc
-            if (head->next) __builtin_prefetch(head->next, 0, 3);
-            // Lightweight stats (batch flush every 1024 ops)
+        // Fast path: pop from free list
+        if (__builtin_expect(block != nullptr, 1)) {
+            // Get next pointer (stored in user area after header)
+            char* next = *reinterpret_cast<char**>(block + sizeof(SmallBlockHeader));
+            freeList_[bin] = next;
+
+            auto* hdr = reinterpret_cast<SmallBlockHeader*>(block);
+            hdr->magic = SMALL_MAGIC;
+#if FANCY_CANARY_CHECK
+            hdr->userSize = reqSize;
+            hdr->canaryHead = CANARY_VALUE;
+#endif
+
+            userPtr = block + sizeof(SmallBlockHeader);
+
+#if FANCY_POISON_CHECK
+            uint32_t* poisonCheck = reinterpret_cast<uint32_t*>(userPtr);
+            if (*poisonCheck == POISON_FREED) {
+                size_t binSize = SMALL_BIN_SIZE[bin];
+                bool corrupted = false;
+                for (size_t i = sizeof(void*); i < binSize; i += sizeof(uint32_t)) {
+                    if (i + sizeof(uint32_t) <= binSize) {
+                        uint32_t* check = reinterpret_cast<uint32_t*>((char*)userPtr + i);
+                        if (*check != POISON_FREED) {
+                            corrupted = true;
+                            break;
+                        }
+                    }
+                }
+                if (corrupted) {
+#if FANCY_STATS_DETAILED
+                    stats.useAfterFree.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+                    fprintf(stderr, "[FANCY] USE-AFTER-FREE detected at %p (bin %d)\n", userPtr, bin);
+#endif
+                }
+            }
+            std::memset(userPtr, (POISON_UNINIT & 0xFF), SMALL_BIN_SIZE[bin]);
+#endif
+
+#if FANCY_CANARY_CHECK
+            char* canaryPos = (char*)userPtr + reqSize;
+            *reinterpret_cast<uint32_t*>(canaryPos) = CANARY_VALUE;
+#endif
+
+#if FANCY_DOUBLE_FREE_CHECK
+            untrackFreed(userPtr);
+#endif
+
+#if FANCY_STATS_DETAILED
+            stats.smallBinAllocs[bin].fetch_add(1, std::memory_order_relaxed);
+#endif
+#if FANCY_STATS_ENABLED
             if (__builtin_expect((++localAllocCalls_ & 0x3FF) == 0, 0)) {
-                localBytesAllocated_ += localAllocCalls_ * 32;  // Approximate
+                localBytesAllocated_ += localAllocCalls_ * 32;
                 flushStats(stats);
             }
-            return reinterpret_cast<char*>(head) + sizeof(SmallBlockHeader);
+#endif
+            return userPtr;
         }
 
-        // Slow path: allocate from slab
+        // Slow path: allocate from slab (bump pointer)
         size_t totalSz = sizeof(SmallBlockHeader) + SMALL_BIN_SIZE[bin];
+#if FANCY_CANARY_CHECK
+        totalSz += sizeof(uint32_t);
+#endif
         if (__builtin_expect(slabCurrent_[bin] + totalSz > slabEnd_[bin], 0)) {
             char* slab = (char*)allocatePages(SLAB_SIZE);
             if (!slab) return nullptr;
@@ -226,17 +439,34 @@ public:
             slabEnd_[bin] = slab + SLAB_SIZE;
         }
 
-        char* block = slabCurrent_[bin];
+        char* newBlock = slabCurrent_[bin];
         slabCurrent_[bin] += totalSz;
 
-        auto* freeB = reinterpret_cast<SmallFreeBlock*>(block);
-        freeB->hdr.binIndex = bin;
-        freeB->hdr.userSize = reqSize;
+        auto* hdr = reinterpret_cast<SmallBlockHeader*>(newBlock);
+        hdr->magic = SMALL_MAGIC;
+        hdr->binIndex = bin;
+#if FANCY_CANARY_CHECK
+        hdr->userSize = reqSize;
+        hdr->canaryHead = CANARY_VALUE;
+#endif
 
+        userPtr = newBlock + sizeof(SmallBlockHeader);
+
+#if FANCY_CANARY_CHECK
+        char* canaryPos = (char*)userPtr + reqSize;
+        *reinterpret_cast<uint32_t*>(canaryPos) = CANARY_VALUE;
+#endif
+
+#if FANCY_STATS_DETAILED
+        stats.smallBinAllocs[bin].fetch_add(1, std::memory_order_relaxed);
+#endif
+
+#if FANCY_STATS_ENABLED
         localAllocCalls_++;
         localBytesAllocated_ += totalSz;
+#endif
 
-        return block + sizeof(SmallBlockHeader);
+        return userPtr;
     }
 
     __attribute__((always_inline, hot))
@@ -244,25 +474,100 @@ public:
         if (__builtin_expect(!userPtr, 0)) return;
 
         char* blockStart = (char*)userPtr - sizeof(SmallBlockHeader);
-        auto* fb = reinterpret_cast<SmallFreeBlock*>(blockStart);
-        int bin = (int)fb->hdr.binIndex;
+        auto* hdr = reinterpret_cast<SmallBlockHeader*>(blockStart);
+
+        // First verify this is actually a small block
+        if (__builtin_expect(hdr->magic != SMALL_MAGIC, 0)) {
+#if FANCY_STATS_DETAILED
+            stats.corruptedBlocks.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] INVALID SMALL BLOCK at %p (bad magic 0x%X)\n", userPtr, hdr->magic);
+#endif
+            return;
+        }
+
+        int bin = (int)hdr->binIndex;
 
         // Safety check - corrupted block
-        if (__builtin_expect(bin < 0 || bin >= SMALL_BIN_COUNT, 0)) return;
+        if (__builtin_expect(bin < 0 || bin >= SMALL_BIN_COUNT, 0)) {
+#if FANCY_STATS_DETAILED
+            stats.corruptedBlocks.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] CORRUPTED BLOCK at %p (invalid bin %d)\n", userPtr, bin);
+#endif
+            return;
+        }
 
-        // Push to free list (single memory write)
-        fb->next = freeList_[bin];
-        freeList_[bin] = fb;
+#if FANCY_CANARY_CHECK
+        // Check head canary
+        if (hdr->canaryHead != CANARY_VALUE) {
+#if FANCY_STATS_DETAILED
+            stats.corruptedBlocks.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] HEAD CANARY CORRUPTED at %p (expected 0x%X, got 0x%X)\n",
+                   userPtr, CANARY_VALUE, hdr->canaryHead);
+#endif
+        }
+        // Check tail canary
+        char* canaryPos = (char*)userPtr + hdr->userSize;
+        uint32_t tailCanary = *reinterpret_cast<uint32_t*>(canaryPos);
+        if (tailCanary != CANARY_VALUE) {
+#if FANCY_STATS_DETAILED
+            stats.bufferOverflows.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] BUFFER OVERFLOW at %p (tail canary expected 0x%X, got 0x%X)\n",
+                   userPtr, CANARY_VALUE, tailCanary);
+#endif
+        }
+#endif
 
+#if FANCY_DOUBLE_FREE_CHECK
+        // Check for double-free
+        if (isRecentlyFreed(userPtr)) {
+#if FANCY_STATS_DETAILED
+            stats.doubleFreeAttempts.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] DOUBLE-FREE detected at %p (bin %d)\n", userPtr, bin);
+#endif
+            return;  // Don't actually free - prevent corruption
+        }
+        trackFreed(userPtr);
+#endif
+
+#if FANCY_POISON_CHECK
+        // Poison freed memory
+        size_t binSize = SMALL_BIN_SIZE[bin];
+        uint32_t* poisonStart = reinterpret_cast<uint32_t*>(userPtr);
+        for (size_t i = 0; i < binSize; i += sizeof(uint32_t)) {
+            poisonStart[i / sizeof(uint32_t)] = POISON_FREED;
+        }
+#endif
+
+#if FANCY_STATS_DETAILED
+        stats.smallBinFrees[bin].fetch_add(1, std::memory_order_relaxed);
+#endif
+
+        // Push to free list - store next ptr in user area
+        *reinterpret_cast<char**>(blockStart + sizeof(SmallBlockHeader)) = freeList_[bin];
+        freeList_[bin] = blockStart;
+
+#if FANCY_STATS_ENABLED
         // Lightweight stats (batch flush every 1024 ops)
         if (__builtin_expect((++localFreeCalls_ & 0x3FF) == 0, 0)) {
-            localBytesFreed_ += localFreeCalls_ * 32;  // Approximate
+            localBytesFreed_ += localFreeCalls_ * 32;
             flushStats(stats);
         }
+#endif
     }
 
 private:
-    SmallFreeBlock* freeList_[SMALL_BIN_COUNT];
+    // Per-bin free list (linked list through user area)
+    char* freeList_[SMALL_BIN_COUNT];
     // Slab allocator for each bin (avoids calling glibc)
     char* slabCurrent_[SMALL_BIN_COUNT];
     char* slabEnd_[SMALL_BIN_COUNT];
@@ -271,6 +576,11 @@ private:
     size_t localFreeCalls_;
     size_t localBytesAllocated_;
     size_t localBytesFreed_;
+#if FANCY_DOUBLE_FREE_CHECK
+    // Circular buffer tracking recently freed pointers
+    void* freedTracker_[FREED_TRACKER_SIZE];
+    size_t freedTrackerIdx_;
+#endif
 };
 
 //-------------------------------------------------------
@@ -351,7 +661,138 @@ public:
     }
 
     size_t usedBytes() const { return usedBytes_; }
+    size_t arenaSize() const { return arenaSize_; }
     bool fullyFree() const { return usedBytes_ == 0; }
+
+    // Heap validation - walks all blocks and checks consistency
+    struct HeapValidationResult {
+        bool valid;
+        size_t totalBlocks;
+        size_t freeBlocks;
+        size_t usedBlocks;
+        size_t corruptedBlocks;
+        size_t totalFreeBytes;
+        size_t largestFreeBlock;
+        double fragmentationRatio;
+        std::vector<const char*> errors;
+    };
+
+    HeapValidationResult validateHeap() const {
+        HeapValidationResult result = {};
+        result.valid = true;
+
+        char* pos = memory_;
+        char* end = memory_ + arenaSize_;
+        size_t totalFree = 0;
+        size_t largestFree = 0;
+
+        while (pos < end) {
+            auto* hdr = reinterpret_cast<BlockHeader*>(pos);
+
+            // Check magic number
+            if (hdr->magic != MAGIC) {
+                result.valid = false;
+                result.corruptedBlocks++;
+                result.errors.push_back("Invalid magic number in block header");
+                break;  // Can't continue - don't know block size
+            }
+
+            // Check block size sanity
+            if (hdr->totalSize == 0 || hdr->totalSize > arenaSize_) {
+                result.valid = false;
+                result.corruptedBlocks++;
+                result.errors.push_back("Invalid block size");
+                break;
+            }
+
+            // Check footer
+            auto* foot = reinterpret_cast<BlockFooter*>(pos + hdr->totalSize - sizeof(BlockFooter));
+            if (foot->magic != MAGIC) {
+                result.valid = false;
+                result.corruptedBlocks++;
+                result.errors.push_back("Invalid magic number in block footer");
+            }
+            if (foot->totalSize != hdr->totalSize) {
+                result.valid = false;
+                result.corruptedBlocks++;
+                result.errors.push_back("Header/footer size mismatch");
+            }
+            if (foot->isFree != hdr->isFree) {
+                result.valid = false;
+                result.corruptedBlocks++;
+                result.errors.push_back("Header/footer free flag mismatch");
+            }
+
+            result.totalBlocks++;
+            if (hdr->isFree) {
+                result.freeBlocks++;
+                totalFree += hdr->totalSize;
+                if (hdr->totalSize > largestFree) {
+                    largestFree = hdr->totalSize;
+                }
+            } else {
+                result.usedBlocks++;
+            }
+
+            pos += hdr->totalSize;
+        }
+
+        result.totalFreeBytes = totalFree;
+        result.largestFreeBlock = largestFree;
+        if (totalFree > 0) {
+            result.fragmentationRatio = 1.0 - (double)largestFree / (double)totalFree;
+        } else {
+            result.fragmentationRatio = 0.0;
+        }
+
+        return result;
+    }
+
+    // Get fragmentation metrics
+    struct FragmentationMetrics {
+        size_t totalArenaBytes;
+        size_t usedBytes;
+        size_t freeBytes;
+        size_t freeBlockCount;
+        size_t largestFreeBlock;
+        size_t smallestFreeBlock;
+        double fragmentationRatio;   // 0.0 = no fragmentation, 1.0 = fully fragmented
+        double utilizationRatio;     // usedBytes / totalArenaBytes
+    };
+
+    FragmentationMetrics getFragmentation() const {
+        FragmentationMetrics m = {};
+        m.totalArenaBytes = arenaSize_;
+        m.usedBytes = usedBytes_;
+        m.freeBytes = arenaSize_ - usedBytes_;
+        m.smallestFreeBlock = SIZE_MAX;
+
+        // Walk the free lists
+        for (int bin = 0; bin < LARGE_BIN_COUNT; bin++) {
+            FreeBlock* cur = freeBins_[bin];
+            while (cur) {
+                m.freeBlockCount++;
+                if (cur->hdr.totalSize > m.largestFreeBlock) {
+                    m.largestFreeBlock = cur->hdr.totalSize;
+                }
+                if (cur->hdr.totalSize < m.smallestFreeBlock) {
+                    m.smallestFreeBlock = cur->hdr.totalSize;
+                }
+                cur = cur->next;
+            }
+        }
+
+        if (m.freeBlockCount == 0) {
+            m.smallestFreeBlock = 0;
+        }
+
+        if (m.freeBytes > 0 && m.largestFreeBlock > 0) {
+            m.fragmentationRatio = 1.0 - (double)m.largestFreeBlock / (double)m.freeBytes;
+        }
+        m.utilizationRatio = (double)m.usedBytes / (double)m.totalArenaBytes;
+
+        return m;
+    }
 
     void destroy() {
         // unmap
@@ -420,6 +861,11 @@ public:
 
                     usedBytes_ += needed;
 
+#if FANCY_STATS_DETAILED
+                    int allocBin = findLargeBin(needed);
+                    stats.largeBinAllocs[allocBin].fetch_add(1, std::memory_order_relaxed);
+#endif
+
                     // Batch stats every 128 ops
                     if (__builtin_expect((++localAllocCount_ & 0x7F) == 0, 0)) {
                         stats.totalAllocCalls.fetch_add(localAllocCount_, std::memory_order_relaxed);
@@ -446,12 +892,68 @@ public:
         char* start = (char*)userPtr - sizeof(BlockHeader);
         auto* hdr = (BlockHeader*)start;
 
-        // Quick validation
-        if (__builtin_expect(hdr->magic != MAGIC, 0)) return;
+        // Validate magic
+        if (__builtin_expect(hdr->magic != MAGIC, 0)) {
+#if FANCY_STATS_DETAILED
+            stats.corruptedBlocks.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] CORRUPTED BLOCK at %p (bad magic 0x%X)\n", userPtr, hdr->magic);
+#endif
+            return;
+        }
+
+#if FANCY_DOUBLE_FREE_CHECK
+        // Check if already free (double-free)
+        if (hdr->isFree) {
+#if FANCY_STATS_DETAILED
+            stats.doubleFreeAttempts.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] DOUBLE-FREE detected at %p (large block)\n", userPtr);
+#endif
+            return;
+        }
+#endif
+
+        // Validate footer
+        auto* foot = getFooter(hdr);
+        if (__builtin_expect(foot->magic != MAGIC, 0)) {
+#if FANCY_STATS_DETAILED
+            stats.bufferOverflows.fetch_add(1, std::memory_order_relaxed);
+#endif
+#ifdef FANCY_DEBUG_VERBOSE
+            fprintf(stderr, "[FANCY] BUFFER OVERFLOW at %p (footer magic corrupted: 0x%X)\n",
+                   userPtr, foot->magic);
+#endif
+        }
+
+#if FANCY_STATS_DETAILED
+        int bin = findLargeBin(hdr->totalSize);
+        stats.largeBinFrees[bin].fetch_add(1, std::memory_order_relaxed);
+#endif
 
         hdr->isFree = true;
         size_t sz = hdr->totalSize;
         usedBytes_ -= sz;
+
+        // Update footer free flag to match header
+        auto* footerToUpdate = getFooter(hdr);
+        footerToUpdate->isFree = true;
+
+#if FANCY_POISON_CHECK
+        // Poison freed memory (after header, before footer)
+        char* poisonStart = (char*)userPtr;
+        size_t poisonSize = sz - sizeof(BlockHeader) - sizeof(BlockFooter);
+        if (poisonSize >= sizeof(uint32_t)) {
+            // Poison in 4-byte chunks
+            uint32_t* p = reinterpret_cast<uint32_t*>(poisonStart);
+            size_t count = poisonSize / sizeof(uint32_t);
+            for (size_t i = 0; i < count; i++) {
+                p[i] = POISON_FREED;
+            }
+        }
+#endif
 
         // Batch stats every 128 ops
         if (__builtin_expect((++localFreeCount_ & 0x7F) == 0, 0)) {
@@ -619,6 +1121,57 @@ public:
         return a;
     }
 
+    // Get all arenas for validation/stats
+    std::vector<Arena*> getArenas() const {
+        std::lock_guard<std::mutex> lk(mgrMutex_);
+        return arenas_;
+    }
+
+    // Get aggregate stats across all arenas
+    void getArenaStats(size_t& totalBytes, size_t& usedBytes, size_t& freeBlocks,
+                       size_t& largestFree, double& fragRatio) const {
+        std::lock_guard<std::mutex> lk(mgrMutex_);
+        totalBytes = 0;
+        usedBytes = 0;
+        freeBlocks = 0;
+        largestFree = 0;
+        double totalFree = 0;
+
+        for (auto* arena : arenas_) {
+            auto frag = arena->getFragmentation();
+            totalBytes += frag.totalArenaBytes;
+            usedBytes += frag.usedBytes;
+            freeBlocks += frag.freeBlockCount;
+            if (frag.largestFreeBlock > largestFree) {
+                largestFree = frag.largestFreeBlock;
+            }
+            totalFree += frag.freeBytes;
+        }
+
+        if (totalFree > 0) {
+            fragRatio = 1.0 - (double)largestFree / totalFree;
+        } else {
+            fragRatio = 0.0;
+        }
+    }
+
+    // Validate all arenas
+    bool validateAllArenas(std::vector<std::string>& errors) const {
+        std::lock_guard<std::mutex> lk(mgrMutex_);
+        bool allValid = true;
+
+        for (size_t i = 0; i < arenas_.size(); i++) {
+            auto result = arenas_[i]->validateHeap();
+            if (!result.valid) {
+                allValid = false;
+                for (auto* err : result.errors) {
+                    errors.push_back(std::string("Arena ") + std::to_string(i) + ": " + err);
+                }
+            }
+        }
+        return allValid;
+    }
+
 private:
     void bgLoop(){
         // runs every 1 second
@@ -648,7 +1201,7 @@ private:
     bool stopThread_;
     bool enableReclamation_;
     std::thread bgThread_;
-    std::mutex mgrMutex_;
+    mutable std::mutex mgrMutex_;  // mutable for const methods
     std::condition_variable cv_;
 };
 
@@ -659,12 +1212,109 @@ class FancyPerThreadAllocator {
 public:
     explicit FancyPerThreadAllocator(size_t defaultArenaSize, bool enableReclamation=false)
         : defaultArenaSize_(defaultArenaSize)
+        , instanceSlot_(nextSlot_.fetch_add(1, std::memory_order_relaxed))
     {
         manager_ = std::make_shared<GlobalArenaManager>(enableReclamation);
     }
 
+    ~FancyPerThreadAllocator() {
+        // Clean up our entry in the thread-local cache
+        // Note: This only cleans up the current thread's entry
+        if (instanceSlot_ < TLD_FAST_SLOTS) {
+            if (tldCache_.keys[instanceSlot_] == this) {
+                delete tldCache_.values[instanceSlot_];
+                tldCache_.keys[instanceSlot_] = nullptr;
+                tldCache_.values[instanceSlot_] = nullptr;
+            }
+        } else {
+            auto it = tldCache_.overflow.find(this);
+            if (it != tldCache_.overflow.end()) {
+                delete it->second;
+                tldCache_.overflow.erase(it);
+            }
+        }
+    }
+
+    // Disable copy (allocator manages unique resources)
+    FancyPerThreadAllocator(const FancyPerThreadAllocator&) = delete;
+    FancyPerThreadAllocator& operator=(const FancyPerThreadAllocator&) = delete;
+
     AllocStatsSnapshot getStatsSnapshot() const {
         return stats_.snapshot();
+    }
+
+    // Get detailed stats (only meaningful with FANCY_DEBUG)
+    DetailedStatsSnapshot getDetailedStats() const {
+        DetailedStatsSnapshot ds = {};
+        ds.basic = stats_.snapshot();
+
+#if FANCY_STATS_DETAILED
+        // Copy per-bin stats
+        for (int i = 0; i < 16; i++) {
+            ds.smallBinAllocCounts[i] = stats_.smallBinAllocs[i].load(std::memory_order_relaxed);
+            ds.smallBinFreeCounts[i] = stats_.smallBinFrees[i].load(std::memory_order_relaxed);
+            ds.smallBinCurrentCount[i] = ds.smallBinAllocCounts[i] - ds.smallBinFreeCounts[i];
+
+            ds.largeBinAllocCounts[i] = stats_.largeBinAllocs[i].load(std::memory_order_relaxed);
+            ds.largeBinFreeCounts[i] = stats_.largeBinFrees[i].load(std::memory_order_relaxed);
+            ds.largeBinCurrentCount[i] = ds.largeBinAllocCounts[i] - ds.largeBinFreeCounts[i];
+        }
+
+        ds.doubleFreeAttempts = stats_.doubleFreeAttempts.load(std::memory_order_relaxed);
+        ds.bufferOverflowsDetected = stats_.bufferOverflows.load(std::memory_order_relaxed);
+        ds.useAfterFreeDetected = stats_.useAfterFree.load(std::memory_order_relaxed);
+        ds.corruptedBlocksDetected = stats_.corruptedBlocks.load(std::memory_order_relaxed);
+#endif
+
+        // Get arena-level stats
+        manager_->getArenaStats(ds.totalArenaBytes, ds.usedArenaBytes,
+                                ds.freeBlockCount, ds.largestFreeBlock,
+                                ds.fragmentationRatio);
+
+        return ds;
+    }
+
+    // Validate heap integrity
+    bool validateHeap(std::vector<std::string>& errors) const {
+        return manager_->validateAllArenas(errors);
+    }
+
+    // Quick heap check (returns false if any corruption detected)
+    bool isHeapValid() const {
+        std::vector<std::string> errors;
+        return validateHeap(errors);
+    }
+
+    // Print detailed stats to stderr
+    void printDetailedStats() const {
+        auto ds = getDetailedStats();
+        ds.print();
+    }
+
+    // Check for potential memory leaks (live allocations at shutdown)
+    struct LeakReport {
+        size_t liveAllocations;
+        size_t liveBytes;
+        bool hasLeaks() const { return liveAllocations > 0; }
+
+        void print() const {
+            if (hasLeaks()) {
+                fprintf(stderr, "\n=== MEMORY LEAK REPORT ===\n");
+                fprintf(stderr, "Live allocations: %zu\n", liveAllocations);
+                fprintf(stderr, "Live bytes:       %zu\n", liveBytes);
+                fprintf(stderr, "==========================\n\n");
+            } else {
+                fprintf(stderr, "\n=== No memory leaks detected ===\n\n");
+            }
+        }
+    };
+
+    LeakReport checkLeaks() const {
+        LeakReport report = {};
+        auto snap = stats_.snapshot();
+        report.liveAllocations = snap.totalAllocCalls - snap.totalFreeCalls;
+        report.liveBytes = snap.currentUsedBytes;
+        return report;
     }
 
     __attribute__((always_inline, hot))
@@ -683,24 +1333,64 @@ public:
     void deallocate(void* ptr) {
         if (__builtin_expect(!ptr, 0)) return;
         auto* tld = getThreadData();
-        // Check magic at offset -4 to distinguish small vs large
-        // Small blocks have binIndex at offset -16, large have MAGIC at -4
-        uint32_t mg = *reinterpret_cast<uint32_t*>((char*)ptr - 4);
-        if (__builtin_expect(mg == Arena::MAGIC, 0)) {
-            tld->arena->deallocate(ptr, stats_);
-        } else {
+        // Check magic at start of header to distinguish small vs large
+        // Small blocks have 16-bit SMALL_MAGIC (0xFACE), large blocks have Arena::MAGIC
+        char* headerStart = (char*)ptr - sizeof(SmallBlockHeader);
+        uint16_t mg = *reinterpret_cast<uint16_t*>(headerStart);
+        if (__builtin_expect(mg == SMALL_MAGIC, 1)) {
             tld->smallCache.freeSmall(ptr, stats_);
+        } else {
+            // Large block - header starts at ptr - sizeof(Arena::BlockHeader)
+            tld->arena->deallocate(ptr, stats_);
         }
     }
 
 private:
-    static thread_local ThreadLocalData* tld_;
+    // Fast TLD lookup using allocator ID + small array (common case)
+    // Falls back to map for rare case of many allocators
+    static constexpr size_t TLD_FAST_SLOTS = 8;
+
+    struct TLDCache {
+        const FancyPerThreadAllocator* keys[TLD_FAST_SLOTS] = {};
+        ThreadLocalData* values[TLD_FAST_SLOTS] = {};
+        std::unordered_map<const FancyPerThreadAllocator*, ThreadLocalData*> overflow;
+    };
+
+    static thread_local TLDCache tldCache_;
+
+    // Allocator instance ID for fast array lookup
+    size_t instanceSlot_;
+    static std::atomic<size_t> nextSlot_;
 
     __attribute__((always_inline, hot))
     ThreadLocalData* getThreadData() {
-        ThreadLocalData* t = tld_;
-        if (__builtin_expect(t != nullptr, 1)) {
-            return t;
+        // Fast path: check our dedicated slot first
+        if (__builtin_expect(instanceSlot_ < TLD_FAST_SLOTS, 1)) {
+            ThreadLocalData* tld = tldCache_.values[instanceSlot_];
+            if (__builtin_expect(tld != nullptr && tldCache_.keys[instanceSlot_] == this, 1)) {
+                return tld;
+            }
+        }
+        return getThreadDataSlow();
+    }
+
+    __attribute__((noinline, cold))
+    ThreadLocalData* getThreadDataSlow() {
+        // Check fast slots first
+        if (instanceSlot_ < TLD_FAST_SLOTS) {
+            if (tldCache_.keys[instanceSlot_] == this) {
+                return tldCache_.values[instanceSlot_];
+            }
+            // Slot available, claim it
+            if (tldCache_.keys[instanceSlot_] == nullptr) {
+                return initThreadData();
+            }
+        }
+
+        // Fall back to overflow map
+        auto it = tldCache_.overflow.find(this);
+        if (it != tldCache_.overflow.end()) {
+            return it->second;
         }
         return initThreadData();
     }
@@ -708,8 +1398,15 @@ private:
     __attribute__((noinline, cold))
     ThreadLocalData* initThreadData() {
         Arena* a = manager_->createArena(defaultArenaSize_);
-        tld_ = new ThreadLocalData{a, ThreadLocalSmallCache()};
-        return tld_;
+        auto* tld = new ThreadLocalData{a, ThreadLocalSmallCache()};
+
+        if (instanceSlot_ < TLD_FAST_SLOTS) {
+            tldCache_.keys[instanceSlot_] = this;
+            tldCache_.values[instanceSlot_] = tld;
+        } else {
+            tldCache_.overflow[this] = tld;
+        }
+        return tld;
     }
 
     size_t defaultArenaSize_;
@@ -717,6 +1414,7 @@ private:
     mutable AllocStats stats_;
 };
 
-thread_local ThreadLocalData* FancyPerThreadAllocator::tld_ = nullptr;
+thread_local FancyPerThreadAllocator::TLDCache FancyPerThreadAllocator::tldCache_;
+std::atomic<size_t> FancyPerThreadAllocator::nextSlot_{0};
 
 #endif // MEMORY_ALLOCATOR_H
