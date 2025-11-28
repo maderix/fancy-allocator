@@ -1742,7 +1742,6 @@ namespace bootstrap {
     struct BootstrapAllocator {
         char* heap = nullptr;
         size_t offset = 0;
-        bool initialized = false;
 
         void* alloc(size_t size) {
             if (!heap) {
@@ -1768,20 +1767,37 @@ namespace bootstrap {
 
     static BootstrapAllocator bootstrapAlloc;
     static thread_local bool inInit = false;
-    static std::atomic<bool> mainAllocReady{false};
+    static std::atomic<int> allocState{0};  // 0=uninit, 1=ready, 2=shutdown
+
+    inline bool isReady() {
+        return allocState.load(std::memory_order_acquire) == 1;
+    }
+
+    inline bool isShutdown() {
+        return allocState.load(std::memory_order_acquire) == 2;
+    }
+
+    // Guard that marks allocator as shutdown on destruction
+    struct ShutdownGuard {
+        ~ShutdownGuard() {
+            allocState.store(2, std::memory_order_release);
+        }
+    };
 }
 
 // Global allocator instance for C API
 // Uses 64MB default arena size, with background reclamation disabled for performance
 inline FancyPerThreadAllocator& getFancyGlobalAllocator() {
+    // ShutdownGuard must be declared BEFORE globalAllocator so it's destroyed AFTER
+    static bootstrap::ShutdownGuard shutdownGuard;
     static FancyPerThreadAllocator globalAllocator(64 * 1024 * 1024, false);
-    bootstrap::mainAllocReady.store(true, std::memory_order_release);
+    bootstrap::allocState.store(1, std::memory_order_release);
     return globalAllocator;
 }
 
-// Check if we should use bootstrap allocator (during init)
+// Check if we should use bootstrap allocator (during init or shutdown)
 inline bool useBootstrap() {
-    return bootstrap::inInit || !bootstrap::mainAllocReady.load(std::memory_order_acquire);
+    return bootstrap::inInit || !bootstrap::isReady() || bootstrap::isShutdown();
 }
 
 // RAII guard for initialization
