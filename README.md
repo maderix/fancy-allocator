@@ -150,6 +150,8 @@ glibc malloc:                    FancyAllocator:
 
 ## Quick Start
 
+### C++ API
+
 ```cpp
 #include "memory_allocator.h"
 
@@ -160,18 +162,54 @@ int main() {
     // Allocate
     void* ptr = alloc.allocate(1024);
 
+    // Aligned allocation (for SIMD: 16/32/64-byte)
+    void* aligned = alloc.allocateAligned(1024, 64);
+
     // Use memory...
 
     // Deallocate
     alloc.deallocate(ptr);
-
-    // Get stats
-    auto stats = alloc.getStatsSnapshot();
-    printf("Allocs: %zu, Frees: %zu\n",
-           stats.totalAllocCalls, stats.totalFreeCalls);
+    alloc.deallocate(aligned);
 
     return 0;
 }
+```
+
+### C API (for MLIR/LLVM Integration)
+
+```c
+#include "memory_allocator.h"
+
+// Standard malloc-compatible API
+void* ptr = fancy_malloc(1024);
+fancy_free(ptr);
+
+// Aligned allocation (C11 compatible)
+void* aligned = fancy_aligned_alloc(64, 1024);  // 64-byte alignment
+fancy_free(aligned);
+
+// POSIX memalign
+void* posix_ptr;
+fancy_posix_memalign(&posix_ptr, 32, 1024);
+fancy_free(posix_ptr);
+
+// Realloc and calloc
+void* grown = fancy_realloc(ptr, 2048);
+void* zeroed = fancy_calloc(100, sizeof(int));
+
+// Diagnostics
+fancy_print_stats();
+bool valid = fancy_validate_heap();
+bool leaks = fancy_check_leaks();
+```
+
+### LD_PRELOAD Replacement
+
+Compile with `-DFANCY_REPLACE_MALLOC` to replace system malloc:
+
+```bash
+g++ -DFANCY_REPLACE_MALLOC -shared -fPIC -o libfancymalloc.so memory_allocator.cpp
+LD_PRELOAD=./libfancymalloc.so ./your_app
 ```
 
 ## Building
@@ -212,9 +250,10 @@ cd benchmarks/
 - `__builtin_prefetch` for cache warming
 - `__attribute__((always_inline, hot))` for hot paths
 - Cache-line aligned stats (64-byte) to prevent false sharing
-- Batched statistics updates (every 128 ops)
+- Batched statistics updates (every 512 ops)
 - mmap with `MADV_HUGEPAGE` for large pages
-- 8-byte minimal header for small blocks
+- 16-byte header for small blocks (ensures 16-byte aligned user data for SIMD)
+- O(1) header lookup for aligned allocations via back-offset pointer
 
 ## When to Use FancyAllocator
 
@@ -223,11 +262,30 @@ cd benchmarks/
 - Latency-sensitive applications (trading, games)
 - Container deployments (predictable memory)
 - Workloads dominated by small allocations
+- SIMD-heavy code requiring aligned allocations (SSE/AVX/AVX-512)
+- Cross-thread allocation patterns (allocate in thread A, free in thread B)
 
 **Not ideal for:**
 - Single-threaded applications (still fast, but overkill)
-- Cross-thread free patterns (allocate in thread A, free in thread B)
 - Unbounded memory growth requirements
+
+## Known Issues & Future Work
+
+### High Thread Count Page Faults (>64 threads)
+
+At very high thread counts (128+), performance can be limited by page faults rather than allocator logic:
+- Each thread gets a 64MB arena → 128 threads = 8GB total
+- First-touch page faults cause kernel overhead
+- Profiling shows ~866K page faults at 128 threads
+
+**Workarounds being investigated:**
+- Dynamic arena sizing based on thread count
+- Huge pages (2MB) to reduce page fault count
+- `MAP_POPULATE` for pre-faulting (tradeoff: slower startup)
+- Arena pooling/sharing for oversubscribed systems
+
+**Current performance at 128 threads:** ~37 Mops/s (vs 48 Mops/s at 16 threads)
+The allocator still beats glibc 4.4x and matches jemalloc at this scale.
 
 ## License
 

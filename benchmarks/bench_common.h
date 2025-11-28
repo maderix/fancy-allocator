@@ -64,8 +64,28 @@ void worker(
     std::uniform_int_distribution<int> largeDist(4096, 32768);
     std::uniform_int_distribution<int> ttlDist(50, 2000);
 
+    // Pre-compute ALL random values to exclude RNG from timing
+    std::vector<size_t> preSizes(OPS_PER_THREAD);
+    std::vector<int> preTTLs(OPS_PER_THREAD);
+    for (int i = 0; i < OPS_PER_THREAD; i++) {
+        int c = catDist(rng);
+        if (c <= 60) {
+            preSizes[i] = smallDist(rng);
+        } else if (c <= 90) {
+            preSizes[i] = medDist(rng);
+        } else {
+            preSizes[i] = largeDist(rng);
+        }
+        preTTLs[i] = ttlDist(rng);
+    }
+
     size_t localAllocs = 0;
     size_t localFrees = 0;
+
+    // Warm up: do a dummy allocation to initialize thread-local structures
+    // This ensures arena creation happens BEFORE timing starts
+    void* warmup = alloc_fn(64);
+    if (warmup) free_fn(warmup);
 
     // Signal ready and wait for start
     readyCount.fetch_add(1, std::memory_order_release);
@@ -89,24 +109,16 @@ void worker(
             slot.ttl--;
         }
 
-        // Allocate if slot is empty
+        // Allocate if slot is empty (using pre-computed random values)
         if (!slot.ptr) {
-            int c = catDist(rng);
-            size_t sz;
-            if (c <= 60) {
-                sz = smallDist(rng);      // 60% small (16-256)
-            } else if (c <= 90) {
-                sz = medDist(rng);        // 30% medium (512-2048)
-            } else {
-                sz = largeDist(rng);      // 10% large (4096-32768)
-            }
+            size_t sz = preSizes[i];
 
             void* p = alloc_fn(sz);
             if (p) {
                 // Touch memory to ensure actual allocation
                 memset(p, 0x42, sz > 64 ? 64 : sz);
                 slot.ptr = p;
-                slot.ttl = ttlDist(rng);
+                slot.ttl = preTTLs[i];
                 localAllocs++;
             }
         }

@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <cstdio>      // fprintf for debug output
+#include <new>         // std::align
+#include <cerrno>      // EINVAL, ENOMEM for posix_memalign
 
 //-------------------------------------------------------
 // Debug/Safety Configuration
@@ -76,6 +78,27 @@ inline void freePages(void* ptr, size_t size) {
         munmap(ptr, size);
     }
 }
+
+//-------------------------------------------------------
+// Alignment helper functions
+//-------------------------------------------------------
+inline bool isPowerOfTwo(size_t n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+inline size_t alignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+inline void* alignPointer(void* ptr, size_t alignment) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t aligned = (addr + alignment - 1) & ~(alignment - 1);
+    return reinterpret_cast<void*>(aligned);
+}
+
+// Maximum supported alignment (must be power of 2)
+static constexpr size_t MAX_ALIGNMENT = 4096;
+static constexpr size_t DEFAULT_ALIGNMENT = 16;  // Default for malloc compatibility
 
 //-------------------------------------------------------
 // Adaptive Spinlock - faster than std::mutex for short critical sections
@@ -248,17 +271,21 @@ static constexpr size_t MAX_SMALL_SIZE = 512;
 // Reduced to 16-bit for smaller header
 static constexpr uint16_t SMALL_MAGIC = 0xFACE;
 
-// Minimal header: 8 bytes (aligned) in release, 16 bytes in debug
-struct alignas(8) SmallBlockHeader {
+// Header must be 16 bytes for 16-byte aligned user data (required for malloc/SIMD compatibility)
+// Layout: [header 16B][user data 16B-aligned]
+struct alignas(16) SmallBlockHeader {
     uint16_t magic;       // 2 bytes - Always SMALL_MAGIC
     uint8_t binIndex;     // 1 byte  - 0-15 bins (max 255)
-    uint8_t flags;        // 1 byte  - Reserved for future use
-    uint32_t padding;     // 4 bytes - Align to 8 bytes for pointer storage
+    uint8_t flags;        // 1 byte  - Reserved
+    uint32_t userSize;    // 4 bytes - For realloc support
 #if FANCY_CANARY_CHECK
-    uint32_t userSize;    // 4 bytes - Only needed for canary position
-    uint32_t canaryHead;  // 4 bytes - Canary at start (checked for corruption)
+    uint32_t canaryHead;  // 4 bytes - Debug only
+    uint32_t pad_;        // 4 bytes - Pad to 16 in debug
+#else
+    uint64_t pad_;        // 8 bytes - Pad to 16 for user data alignment
 #endif
 };
+static_assert(sizeof(SmallBlockHeader) == 16, "SmallBlockHeader must be 16 bytes for alignment");
 struct SmallFreeBlock {
     SmallBlockHeader hdr;
     SmallFreeBlock* next;
@@ -289,6 +316,7 @@ inline int fastFindSmallBin(size_t size) {
 
 class ThreadLocalSmallCache {
     static constexpr size_t SLAB_SIZE = 64 * 1024;  // 64KB slabs
+    static constexpr size_t MAX_SLABS_PER_BIN = 64; // Track up to 64 slabs per bin
 
 public:
     ThreadLocalSmallCache() {
@@ -296,7 +324,9 @@ public:
             freeList_[i] = nullptr;
             slabCurrent_[i] = nullptr;
             slabEnd_[i] = nullptr;
+            slabCount_[i] = 0;
         }
+        ownerSlot_ = 0;
         localAllocCalls_ = 0;
         localFreeCalls_ = 0;
         localBytesAllocated_ = 0;
@@ -307,8 +337,17 @@ public:
 #endif
     }
     ~ThreadLocalSmallCache() {
-        // Note: slabs are leaked for simplicity (or could track and munmap)
+        // Clean up all slabs
+        for (int bin = 0; bin < SMALL_BIN_COUNT; bin++) {
+            for (size_t i = 0; i < slabCount_[bin]; i++) {
+                if (slabs_[bin][i]) {
+                    freePages(slabs_[bin][i], SLAB_SIZE);
+                }
+            }
+        }
     }
+
+    void setOwnerSlot(uint16_t slot) { ownerSlot_ = slot; }
 
     // Flush local stats to global (called periodically or on thread exit)
     void flushStats(AllocStats& stats) {
@@ -373,8 +412,8 @@ public:
 
             auto* hdr = reinterpret_cast<SmallBlockHeader*>(block);
             hdr->magic = SMALL_MAGIC;
-#if FANCY_CANARY_CHECK
             hdr->userSize = reqSize;
+#if FANCY_CANARY_CHECK
             hdr->canaryHead = CANARY_VALUE;
 #endif
 
@@ -432,11 +471,17 @@ public:
 #if FANCY_CANARY_CHECK
         totalSz += sizeof(uint32_t);
 #endif
+        // Always round up to 16 bytes for alignment (required for SIMD compatibility)
+        totalSz = alignUp(totalSz, 16);
         if (__builtin_expect(slabCurrent_[bin] + totalSz > slabEnd_[bin], 0)) {
             char* slab = (char*)allocatePages(SLAB_SIZE);
             if (!slab) return nullptr;
             slabCurrent_[bin] = slab;
             slabEnd_[bin] = slab + SLAB_SIZE;
+            // Track slab for cleanup
+            if (slabCount_[bin] < MAX_SLABS_PER_BIN) {
+                slabs_[bin][slabCount_[bin]++] = slab;
+            }
         }
 
         char* newBlock = slabCurrent_[bin];
@@ -445,8 +490,9 @@ public:
         auto* hdr = reinterpret_cast<SmallBlockHeader*>(newBlock);
         hdr->magic = SMALL_MAGIC;
         hdr->binIndex = bin;
-#if FANCY_CANARY_CHECK
+        hdr->flags = 0;
         hdr->userSize = reqSize;
+#if FANCY_CANARY_CHECK
         hdr->canaryHead = CANARY_VALUE;
 #endif
 
@@ -565,12 +611,26 @@ public:
 #endif
     }
 
+    // Get user-requested size for a small allocation
+    size_t getSmallAllocSize(void* userPtr) {
+        if (!userPtr) return 0;
+        char* blockStart = (char*)userPtr - sizeof(SmallBlockHeader);
+        auto* hdr = reinterpret_cast<SmallBlockHeader*>(blockStart);
+        if (hdr->magic != SMALL_MAGIC) return 0;
+        return hdr->userSize;
+    }
+
 private:
     // Per-bin free list (linked list through user area)
     char* freeList_[SMALL_BIN_COUNT];
     // Slab allocator for each bin (avoids calling glibc)
     char* slabCurrent_[SMALL_BIN_COUNT];
     char* slabEnd_[SMALL_BIN_COUNT];
+    // Track slabs for cleanup on thread exit
+    char* slabs_[SMALL_BIN_COUNT][MAX_SLABS_PER_BIN];
+    size_t slabCount_[SMALL_BIN_COUNT];
+    // Owner allocator slot for cross-thread deallocation
+    uint16_t ownerSlot_;
     // Thread-local stats to avoid atomic contention
     size_t localAllocCalls_;
     size_t localFreeCalls_;
@@ -608,21 +668,41 @@ public:
         return std::min(std::max(0, log2 - 9), LARGE_BIN_COUNT - 1);
     }
 
-    struct BlockHeader {
+    // All block structures must be 16-byte aligned for better SIMD compatibility
+    struct alignas(16) BlockHeader {
         uint32_t magic;
+        uint16_t ownerSlot;   // Owner allocator slot (for cross-thread free)
+        uint16_t alignOffset; // Offset from header end to user ptr
         size_t   totalSize;
         size_t   userSize;
         bool     isFree;
+        char     pad_[7];     // Pad to 16-byte boundary
     };
-    struct BlockFooter {
+    static_assert(sizeof(BlockHeader) == 32, "BlockHeader must be 32 bytes");
+    static_assert(sizeof(BlockHeader) % 16 == 0, "BlockHeader must be 16-byte aligned");
+
+    struct alignas(16) BlockFooter {
         uint32_t magic;
+        uint32_t padding_;   // Explicit padding
         size_t   totalSize;
         bool     isFree;
+        char     pad_[7];    // Pad to 16-byte boundary
     };
-    struct FreeBlock {
+    static_assert(sizeof(BlockFooter) == 32, "BlockFooter must be 32 bytes");
+    static_assert(sizeof(BlockFooter) % 16 == 0, "BlockFooter must be 16-byte aligned");
+
+    struct alignas(16) FreeBlock {
         BlockHeader hdr;
         FreeBlock* next;
+        char pad_[8];  // Pad to 48 bytes (multiple of 16)
     };
+    static_assert(sizeof(FreeBlock) % 16 == 0, "FreeBlock must be 16-byte aligned");
+
+    // Helper to round up to alignment (16-byte default for SIMD)
+    static constexpr size_t ARENA_ALIGNMENT = 16;
+    static constexpr size_t arenaAlignUp(size_t size) {
+        return (size + ARENA_ALIGNMENT - 1) & ~(ARENA_ALIGNMENT - 1);
+    }
 
     Arena(size_t arenaSize)
         : arenaSize_(arenaSize), usedBytes_(0)
@@ -663,6 +743,34 @@ public:
     size_t usedBytes() const { return usedBytes_; }
     size_t arenaSize() const { return arenaSize_; }
     bool fullyFree() const { return usedBytes_ == 0; }
+
+    // Get the user-requested size of an allocation (for realloc)
+    // O(1) lookup using back-offset
+    size_t getAllocSize(void* userPtr) const {
+        if (!userPtr) return 0;
+        char* ptr = (char*)userPtr;
+
+        // Fast path: default alignment
+        auto* hdr = (BlockHeader*)(ptr - sizeof(BlockHeader));
+        if (hdr->magic == MAGIC && !hdr->isFree && hdr->alignOffset == 0) {
+            return hdr->userSize;
+        }
+
+        // Non-default alignment: use back-offset
+        uint16_t backOffset = *reinterpret_cast<const uint16_t*>(ptr - sizeof(uint16_t));
+        if (backOffset > 0 && backOffset <= MAX_ALIGNMENT) {
+            hdr = (BlockHeader*)(ptr - sizeof(BlockHeader) - backOffset);
+            if (hdr->magic == MAGIC && !hdr->isFree && hdr->alignOffset == backOffset) {
+                return hdr->userSize;
+            }
+        }
+        return 0;
+    }
+
+    // Check if this arena owns the given pointer
+    bool ownsPointer(void* ptr) const {
+        return ptr >= memory_ && ptr < memory_ + arenaSize_;
+    }
 
     // Heap validation - walks all blocks and checks consistency
     struct HeapValidationResult {
@@ -803,10 +911,19 @@ public:
     }
 
     __attribute__((hot))
-    void* allocate(size_t reqSize, size_t alignment, AllocStats& stats) {
+    void* allocate(size_t reqSize, size_t alignment, AllocStats& stats, uint16_t ownerSlot = 0) {
         // No lock needed - each thread has its own Arena
+
+        // Ensure alignment is at least ARENA_ALIGNMENT and power of 2
+        if (alignment < ARENA_ALIGNMENT) alignment = ARENA_ALIGNMENT;
+        if (!isPowerOfTwo(alignment) || alignment > MAX_ALIGNMENT) {
+            return nullptr;  // Invalid alignment
+        }
+
         constexpr size_t overhead = sizeof(BlockHeader) + sizeof(BlockFooter);
-        const size_t totalNeeded = reqSize + overhead;
+        // Add extra space for alignment padding
+        const size_t alignPadding = (alignment > ARENA_ALIGNMENT) ? (alignment - 1) : 0;
+        const size_t totalNeeded = arenaAlignUp(reqSize + overhead + alignPadding);
         const int startBin = findLargeBin(totalNeeded);
 
         // Search bins from startBin upward for a fit
@@ -817,10 +934,23 @@ public:
             FreeBlock* prev = nullptr;
             do {
                 if (__builtin_expect(cur->hdr.totalSize >= totalNeeded, 1)) {
-                    // Fast path: most allocations need no alignment padding
                     char* start = (char*)cur;
-                    char* userArea = start + sizeof(BlockHeader);
-                    size_t needed = totalNeeded;
+                    char* baseUserArea = start + sizeof(BlockHeader);
+
+                    // Calculate aligned user pointer
+                    char* alignedUserArea = (char*)alignPointer(baseUserArea, alignment);
+                    uint16_t alignOffset = (uint16_t)(alignedUserArea - baseUserArea);
+
+                    // Adjust needed size to account for actual alignment
+                    size_t actualNeeded = arenaAlignUp(reqSize + overhead + alignOffset);
+
+                    // Check if block is still large enough after alignment adjustment
+                    if (actualNeeded > cur->hdr.totalSize) {
+                        // This block doesn't fit after alignment, try next
+                        prev = cur;
+                        cur = cur->next;
+                        continue;
+                    }
 
                     // Remove from current bin (common: head of list)
                     if (__builtin_expect(prev == nullptr, 1))
@@ -828,15 +958,18 @@ public:
                     else
                         prev->next = cur->next;
 
-                    // Split if worthwhile
-                    size_t leftover = cur->hdr.totalSize - needed;
-                    if (leftover >= sizeof(FreeBlock) + overhead) {
-                        char* leftoverAddr = start + needed;
+                    // Split if worthwhile - ensure leftover is also aligned
+                    size_t leftover = cur->hdr.totalSize - actualNeeded;
+                    const size_t minSplitSize = arenaAlignUp(sizeof(FreeBlock) + overhead);
+                    if (leftover >= minSplitSize) {
+                        char* leftoverAddr = start + actualNeeded;
                         auto* leftoverFB = (FreeBlock*)leftoverAddr;
                         leftoverFB->hdr.magic = MAGIC;
                         leftoverFB->hdr.totalSize = leftover;
                         leftoverFB->hdr.userSize = 0;
                         leftoverFB->hdr.isFree = true;
+                        leftoverFB->hdr.ownerSlot = 0;
+                        leftoverFB->hdr.alignOffset = 0;
                         leftoverFB->next = nullptr;
 
                         auto* leftoverFoot = getFooter(&leftoverFB->hdr);
@@ -846,37 +979,48 @@ public:
 
                         insertIntoBin(leftoverFB);
                     } else {
-                        needed = cur->hdr.totalSize;
+                        actualNeeded = cur->hdr.totalSize;
                     }
 
-                    // Mark allocated
+                    // Mark allocated with alignment info
                     cur->hdr.isFree = false;
                     cur->hdr.userSize = reqSize;
-                    cur->hdr.totalSize = needed;
+                    cur->hdr.totalSize = actualNeeded;
+                    cur->hdr.ownerSlot = ownerSlot;
+                    cur->hdr.alignOffset = alignOffset;
+
+                    // Store back-offset right before user pointer for O(1) header lookup
+                    // Only needed when alignOffset > 0 (non-default alignment)
+                    if (alignOffset > 0) {
+                        uint16_t* backOffset = reinterpret_cast<uint16_t*>(alignedUserArea) - 1;
+                        *backOffset = alignOffset;
+                    }
 
                     auto* foot = getFooter(&cur->hdr);
                     foot->magic = MAGIC;
-                    foot->totalSize = needed;
+                    foot->totalSize = actualNeeded;
                     foot->isFree = false;
 
-                    usedBytes_ += needed;
+                    usedBytes_ += actualNeeded;
 
 #if FANCY_STATS_DETAILED
-                    int allocBin = findLargeBin(needed);
+                    int allocBin = findLargeBin(actualNeeded);
                     stats.largeBinAllocs[allocBin].fetch_add(1, std::memory_order_relaxed);
 #endif
 
-                    // Batch stats every 128 ops
-                    if (__builtin_expect((++localAllocCount_ & 0x7F) == 0, 0)) {
+#if FANCY_STATS_ENABLED
+                    // Batch stats every 512 ops (increased for better scaling)
+                    if (__builtin_expect((++localAllocCount_ & 0x1FF) == 0, 0)) {
                         stats.totalAllocCalls.fetch_add(localAllocCount_, std::memory_order_relaxed);
-                        stats.currentUsedBytes.fetch_add(localAllocBytes_ + needed, std::memory_order_relaxed);
+                        stats.currentUsedBytes.fetch_add(localAllocBytes_ + actualNeeded, std::memory_order_relaxed);
                         localAllocCount_ = 0;
                         localAllocBytes_ = 0;
                     } else {
-                        localAllocBytes_ += needed;
+                        localAllocBytes_ += actualNeeded;
                     }
+#endif
 
-                    return userArea;
+                    return alignedUserArea;
                 }
                 prev = cur;
                 cur = cur->next;
@@ -885,23 +1029,48 @@ public:
         return nullptr;
     }
 
+    // Get block header from user pointer, accounting for alignment offset
+    // O(1) lookup using back-offset stored before user pointer
+    __attribute__((always_inline))
+    BlockHeader* getHeaderFromUserPtr(void* userPtr) {
+        char* ptr = (char*)userPtr;
+
+        // Fast path: check default alignment (alignOffset == 0)
+        // Header is directly before user pointer
+        auto* hdr = (BlockHeader*)(ptr - sizeof(BlockHeader));
+        if (__builtin_expect(hdr->magic == MAGIC && !hdr->isFree && hdr->alignOffset == 0, 1)) {
+            return hdr;
+        }
+
+        // Non-default alignment: read back-offset stored before user pointer
+        // The offset tells us how far the header is
+        uint16_t backOffset = *reinterpret_cast<uint16_t*>(ptr - sizeof(uint16_t));
+        if (backOffset > 0 && backOffset <= MAX_ALIGNMENT) {
+            hdr = (BlockHeader*)(ptr - sizeof(BlockHeader) - backOffset);
+            if (hdr->magic == MAGIC && !hdr->isFree && hdr->alignOffset == backOffset) {
+                return hdr;
+            }
+        }
+
+        return nullptr;
+    }
+
     __attribute__((hot))
     void deallocate(void* userPtr, AllocStats& stats) {
         if (__builtin_expect(!userPtr, 0)) return;
 
-        char* start = (char*)userPtr - sizeof(BlockHeader);
-        auto* hdr = (BlockHeader*)start;
-
-        // Validate magic
-        if (__builtin_expect(hdr->magic != MAGIC, 0)) {
+        auto* hdr = getHeaderFromUserPtr(userPtr);
+        if (__builtin_expect(!hdr, 0)) {
 #if FANCY_STATS_DETAILED
             stats.corruptedBlocks.fetch_add(1, std::memory_order_relaxed);
 #endif
 #ifdef FANCY_DEBUG_VERBOSE
-            fprintf(stderr, "[FANCY] CORRUPTED BLOCK at %p (bad magic 0x%X)\n", userPtr, hdr->magic);
+            fprintf(stderr, "[FANCY] Could not find block header for %p\n", userPtr);
 #endif
             return;
         }
+        char* start = (char*)hdr;
+        // Magic already validated by getHeaderFromUserPtr
 
 #if FANCY_DOUBLE_FREE_CHECK
         // Check if already free (double-free)
@@ -942,21 +1111,23 @@ public:
         footerToUpdate->isFree = true;
 
 #if FANCY_POISON_CHECK
-        // Poison freed memory (after header, before footer)
+        // Poison freed memory (after header+alignOffset, before footer)
+        // Account for alignment offset so we don't poison past the footer
         char* poisonStart = (char*)userPtr;
-        size_t poisonSize = sz - sizeof(BlockHeader) - sizeof(BlockFooter);
-        if (poisonSize >= sizeof(uint32_t)) {
+        size_t usableSize = sz - sizeof(BlockHeader) - sizeof(BlockFooter) - hdr->alignOffset;
+        if (usableSize <= sz && usableSize >= sizeof(uint32_t)) {  // Sanity check
             // Poison in 4-byte chunks
             uint32_t* p = reinterpret_cast<uint32_t*>(poisonStart);
-            size_t count = poisonSize / sizeof(uint32_t);
+            size_t count = usableSize / sizeof(uint32_t);
             for (size_t i = 0; i < count; i++) {
                 p[i] = POISON_FREED;
             }
         }
 #endif
 
-        // Batch stats every 128 ops
-        if (__builtin_expect((++localFreeCount_ & 0x7F) == 0, 0)) {
+#if FANCY_STATS_ENABLED
+        // Batch stats every 512 ops (increased for better scaling)
+        if (__builtin_expect((++localFreeCount_ & 0x1FF) == 0, 0)) {
             stats.totalFreeCalls.fetch_add(localFreeCount_, std::memory_order_relaxed);
             stats.currentUsedBytes.fetch_sub(localFreeBytes_ + sz, std::memory_order_relaxed);
             localFreeCount_ = 0;
@@ -964,6 +1135,7 @@ public:
         } else {
             localFreeBytes_ += sz;
         }
+#endif
 
         auto* fb = (FreeBlock*)hdr;
 
@@ -1333,16 +1505,133 @@ public:
     void deallocate(void* ptr) {
         if (__builtin_expect(!ptr, 0)) return;
         auto* tld = getThreadData();
-        // Check magic at start of header to distinguish small vs large
-        // Small blocks have 16-bit SMALL_MAGIC (0xFACE), large blocks have Arena::MAGIC
+
+        // Fast path: Check for small block first (most common case ~60%)
+        // Small blocks have SMALL_MAGIC at ptr - sizeof(SmallBlockHeader)
         char* headerStart = (char*)ptr - sizeof(SmallBlockHeader);
-        uint16_t mg = *reinterpret_cast<uint16_t*>(headerStart);
-        if (__builtin_expect(mg == SMALL_MAGIC, 1)) {
-            tld->smallCache.freeSmall(ptr, stats_);
-        } else {
-            // Large block - header starts at ptr - sizeof(Arena::BlockHeader)
-            tld->arena->deallocate(ptr, stats_);
+        auto* smallHdr = reinterpret_cast<SmallBlockHeader*>(headerStart);
+        if (__builtin_expect(smallHdr->magic == SMALL_MAGIC, 1)) {
+            // Validate binIndex to avoid false positives from alignment padding
+            if (__builtin_expect(smallHdr->binIndex < SMALL_BIN_COUNT, 1)) {
+                tld->smallCache.freeSmall(ptr, stats_);
+                return;
+            }
         }
+
+        // Large/aligned allocation: check arena ownership
+        if (tld->arena->ownsPointer(ptr)) {
+            tld->arena->deallocate(ptr, stats_);
+            return;
+        }
+
+        // Cross-thread deallocation: find the owning arena
+        deallocateCrossThread(ptr);
+    }
+
+    // Aligned allocation (for SIMD: 16/32/64-byte alignment)
+    __attribute__((always_inline, hot))
+    void* allocateAligned(size_t size, size_t alignment) {
+        if (__builtin_expect(size == 0, 0)) size = 1;
+        if (!isPowerOfTwo(alignment) || alignment > MAX_ALIGNMENT) {
+            return nullptr;  // Invalid alignment
+        }
+
+        // For alignments <= 16, use regular allocate (already 16-byte aligned)
+        if (alignment <= 16 && size <= MAX_SMALL_SIZE) {
+            return allocate(size);
+        }
+
+        // For larger alignments or sizes, use arena with explicit alignment
+        auto* tld = getThreadData();
+        return tld->arena->allocate(size, alignment, stats_,
+                                    static_cast<uint16_t>(instanceSlot_));
+    }
+
+    // Reallocate: grow/shrink allocation, preserving data
+    void* reallocate(void* ptr, size_t newSize) {
+        if (!ptr) return allocate(newSize);
+        if (newSize == 0) {
+            deallocate(ptr);
+            return nullptr;
+        }
+
+        // Get current allocation size
+        size_t oldSize = getAllocSize(ptr);
+        if (oldSize == 0) {
+            // Unknown allocation, can't reallocate
+            return nullptr;
+        }
+
+        // If shrinking significantly or growing, allocate new block
+        if (newSize <= oldSize && newSize >= oldSize / 2) {
+            // No need to reallocate for minor shrinkage
+            return ptr;
+        }
+
+        // Allocate new block
+        void* newPtr = allocate(newSize);
+        if (!newPtr) return nullptr;
+
+        // Copy data
+        size_t copySize = (newSize < oldSize) ? newSize : oldSize;
+        std::memcpy(newPtr, ptr, copySize);
+
+        // Free old block
+        deallocate(ptr);
+        return newPtr;
+    }
+
+    // Calloc: allocate and zero-initialize
+    void* callocate(size_t nmemb, size_t size) {
+        // Check for overflow
+        size_t totalSize = nmemb * size;
+        if (size != 0 && totalSize / size != nmemb) {
+            return nullptr;  // Overflow
+        }
+
+        void* ptr = allocate(totalSize);
+        if (ptr) {
+            std::memset(ptr, 0, totalSize);
+        }
+        return ptr;
+    }
+
+    // Get allocation size (for realloc)
+    size_t getAllocSize(void* ptr) const {
+        if (!ptr) return 0;
+
+        // Check if small allocation (with binIndex validation)
+        char* headerStart = (char*)ptr - sizeof(SmallBlockHeader);
+        auto* smallHdr = reinterpret_cast<SmallBlockHeader*>(headerStart);
+        if (smallHdr->magic == SMALL_MAGIC && smallHdr->binIndex < SMALL_BIN_COUNT) {
+            return smallHdr->userSize;
+        }
+
+        // Check all arenas for large allocation
+        auto arenas = manager_->getArenas();
+        for (auto* arena : arenas) {
+            if (arena->ownsPointer(ptr)) {
+                return arena->getAllocSize(ptr);
+            }
+        }
+        return 0;
+    }
+
+private:
+    // Cross-thread deallocation handler
+    void deallocateCrossThread(void* ptr) {
+        // Find the arena that owns this pointer
+        auto arenas = manager_->getArenas();
+        for (auto* arena : arenas) {
+            if (arena->ownsPointer(ptr)) {
+                arena->deallocate(ptr, stats_);
+                return;
+            }
+        }
+        // Pointer not found in any arena - corrupted or already freed
+#ifdef FANCY_DEBUG_VERBOSE
+        fprintf(stderr, "[FANCY] Cross-thread dealloc: pointer %p not found in any arena\n", ptr);
+#endif
     }
 
 private:
@@ -1354,6 +1643,23 @@ private:
         const FancyPerThreadAllocator* keys[TLD_FAST_SLOTS] = {};
         ThreadLocalData* values[TLD_FAST_SLOTS] = {};
         std::unordered_map<const FancyPerThreadAllocator*, ThreadLocalData*> overflow;
+
+        // Destructor cleans up TLD when thread exits
+        ~TLDCache() {
+            for (size_t i = 0; i < TLD_FAST_SLOTS; i++) {
+                if (values[i]) {
+                    // Note: Arena is managed by GlobalArenaManager, don't delete it here
+                    // Just delete the ThreadLocalData wrapper
+                    delete values[i];
+                    values[i] = nullptr;
+                    keys[i] = nullptr;
+                }
+            }
+            for (auto& [key, tld] : overflow) {
+                delete tld;
+            }
+            overflow.clear();
+        }
     };
 
     static thread_local TLDCache tldCache_;
@@ -1399,6 +1705,8 @@ private:
     ThreadLocalData* initThreadData() {
         Arena* a = manager_->createArena(defaultArenaSize_);
         auto* tld = new ThreadLocalData{a, ThreadLocalSmallCache()};
+        // Set owner slot for cross-thread deallocation tracking
+        tld->smallCache.setOwnerSlot(static_cast<uint16_t>(instanceSlot_));
 
         if (instanceSlot_ < TLD_FAST_SLOTS) {
             tldCache_.keys[instanceSlot_] = this;
@@ -1416,5 +1724,105 @@ private:
 
 thread_local FancyPerThreadAllocator::TLDCache FancyPerThreadAllocator::tldCache_;
 std::atomic<size_t> FancyPerThreadAllocator::nextSlot_{0};
+
+//-------------------------------------------------------
+// 7) C API Shim Layer
+//    Provides malloc/free/aligned_alloc/realloc/calloc
+//    compatible interface for MLIR/LLVM integration
+//-------------------------------------------------------
+
+// Global allocator instance for C API
+// Uses 64MB default arena size, with background reclamation disabled for performance
+inline FancyPerThreadAllocator& getFancyGlobalAllocator() {
+    static FancyPerThreadAllocator globalAllocator(64 * 1024 * 1024, false);
+    return globalAllocator;
+}
+
+// C-compatible API functions
+extern "C" {
+
+// Standard malloc replacement
+inline void* fancy_malloc(size_t size) {
+    return getFancyGlobalAllocator().allocate(size);
+}
+
+// Standard free replacement
+inline void fancy_free(void* ptr) {
+    getFancyGlobalAllocator().deallocate(ptr);
+}
+
+// Aligned allocation (C11 aligned_alloc compatible)
+// alignment must be power of 2, size must be multiple of alignment
+inline void* fancy_aligned_alloc(size_t alignment, size_t size) {
+    return getFancyGlobalAllocator().allocateAligned(size, alignment);
+}
+
+// POSIX posix_memalign compatible
+inline int fancy_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (!memptr) return EINVAL;
+    if (!isPowerOfTwo(alignment) || alignment < sizeof(void*)) return EINVAL;
+
+    void* ptr = getFancyGlobalAllocator().allocateAligned(size, alignment);
+    if (!ptr) return ENOMEM;
+
+    *memptr = ptr;
+    return 0;
+}
+
+// Standard realloc replacement
+inline void* fancy_realloc(void* ptr, size_t size) {
+    return getFancyGlobalAllocator().reallocate(ptr, size);
+}
+
+// Standard calloc replacement
+inline void* fancy_calloc(size_t nmemb, size_t size) {
+    return getFancyGlobalAllocator().callocate(nmemb, size);
+}
+
+// Get allocation size (useful for debugging)
+inline size_t fancy_malloc_usable_size(void* ptr) {
+    return getFancyGlobalAllocator().getAllocSize(ptr);
+}
+
+// Check for memory leaks (returns true if leaks detected)
+inline bool fancy_check_leaks() {
+    return getFancyGlobalAllocator().checkLeaks().hasLeaks();
+}
+
+// Print detailed allocator statistics
+inline void fancy_print_stats() {
+    getFancyGlobalAllocator().printDetailedStats();
+}
+
+// Validate heap integrity (returns true if valid)
+inline bool fancy_validate_heap() {
+    return getFancyGlobalAllocator().isHeapValid();
+}
+
+} // extern "C"
+
+//-------------------------------------------------------
+// 8) Optional: LD_PRELOAD-compatible malloc replacement
+//    Define FANCY_REPLACE_MALLOC to enable
+//-------------------------------------------------------
+#ifdef FANCY_REPLACE_MALLOC
+extern "C" {
+    void* malloc(size_t size) { return fancy_malloc(size); }
+    void free(void* ptr) { fancy_free(ptr); }
+    void* realloc(void* ptr, size_t size) { return fancy_realloc(ptr, size); }
+    void* calloc(size_t nmemb, size_t size) { return fancy_calloc(nmemb, size); }
+    void* aligned_alloc(size_t alignment, size_t size) { return fancy_aligned_alloc(alignment, size); }
+    int posix_memalign(void** memptr, size_t alignment, size_t size) {
+        return fancy_posix_memalign(memptr, alignment, size);
+    }
+    void* memalign(size_t alignment, size_t size) { return fancy_aligned_alloc(alignment, size); }
+    void* valloc(size_t size) { return fancy_aligned_alloc(4096, size); }
+    void* pvalloc(size_t size) {
+        size = (size + 4095) & ~4095ULL;  // Round up to page size
+        return fancy_aligned_alloc(4096, size);
+    }
+    size_t malloc_usable_size(void* ptr) { return fancy_malloc_usable_size(ptr); }
+}
+#endif // FANCY_REPLACE_MALLOC
 
 #endif // MEMORY_ALLOCATOR_H

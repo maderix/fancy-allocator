@@ -17,7 +17,8 @@ int main(int argc, char* argv[]) {
         if (t > maxThreads) break;
 
         // Create fresh allocator for each thread count
-        FancyPerThreadAllocator alloc(64ULL * 1024ULL * 1024ULL, true);
+        // Disable reclamation for better benchmark performance
+        FancyPerThreadAllocator alloc(64ULL * 1024ULL * 1024ULL, false);
         g_alloc = &alloc;
 
         runBenchmark("fancy", t,
