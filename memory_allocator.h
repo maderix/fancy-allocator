@@ -1731,11 +1731,70 @@ std::atomic<size_t> FancyPerThreadAllocator::nextSlot_{0};
 //    compatible interface for MLIR/LLVM integration
 //-------------------------------------------------------
 
+//-------------------------------------------------------
+// Bootstrap allocator for LD_PRELOAD initialization
+// Prevents infinite recursion: malloc -> init -> make_shared -> malloc
+//-------------------------------------------------------
+namespace bootstrap {
+    // Simple bump allocator using mmap for bootstrap phase
+    static constexpr size_t BOOTSTRAP_SIZE = 1024 * 1024;  // 1MB bootstrap heap
+
+    struct BootstrapAllocator {
+        char* heap = nullptr;
+        size_t offset = 0;
+        bool initialized = false;
+
+        void* alloc(size_t size) {
+            if (!heap) {
+                heap = (char*)mmap(nullptr, BOOTSTRAP_SIZE, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (heap == MAP_FAILED) {
+                    heap = nullptr;
+                    return nullptr;
+                }
+            }
+            // Align to 16 bytes
+            size = (size + 15) & ~15ULL;
+            if (offset + size > BOOTSTRAP_SIZE) return nullptr;
+            void* ptr = heap + offset;
+            offset += size;
+            return ptr;
+        }
+
+        bool owns(void* ptr) {
+            return heap && ptr >= heap && ptr < heap + BOOTSTRAP_SIZE;
+        }
+    };
+
+    static BootstrapAllocator bootstrapAlloc;
+    static thread_local bool inInit = false;
+    static std::atomic<bool> mainAllocReady{false};
+}
+
 // Global allocator instance for C API
 // Uses 64MB default arena size, with background reclamation disabled for performance
 inline FancyPerThreadAllocator& getFancyGlobalAllocator() {
     static FancyPerThreadAllocator globalAllocator(64 * 1024 * 1024, false);
+    bootstrap::mainAllocReady.store(true, std::memory_order_release);
     return globalAllocator;
+}
+
+// Check if we should use bootstrap allocator (during init)
+inline bool useBootstrap() {
+    return bootstrap::inInit || !bootstrap::mainAllocReady.load(std::memory_order_acquire);
+}
+
+// RAII guard for initialization
+struct InitGuard {
+    InitGuard() { bootstrap::inInit = true; }
+    ~InitGuard() { bootstrap::inInit = false; }
+};
+
+// Safe initialization that prevents recursion
+inline FancyPerThreadAllocator* getSafeAllocator() {
+    if (bootstrap::inInit) return nullptr;  // Recursion detected
+    InitGuard guard;
+    return &getFancyGlobalAllocator();
 }
 
 // C-compatible API functions
@@ -1804,24 +1863,84 @@ inline bool fancy_validate_heap() {
 //-------------------------------------------------------
 // 8) Optional: LD_PRELOAD-compatible malloc replacement
 //    Define FANCY_REPLACE_MALLOC to enable
+//    Uses bootstrap allocator to avoid infinite recursion during init
 //-------------------------------------------------------
 #ifdef FANCY_REPLACE_MALLOC
 extern "C" {
-    void* malloc(size_t size) { return fancy_malloc(size); }
-    void free(void* ptr) { fancy_free(ptr); }
-    void* realloc(void* ptr, size_t size) { return fancy_realloc(ptr, size); }
-    void* calloc(size_t nmemb, size_t size) { return fancy_calloc(nmemb, size); }
-    void* aligned_alloc(size_t alignment, size_t size) { return fancy_aligned_alloc(alignment, size); }
+    void* malloc(size_t size) {
+        // Use bootstrap during initialization to prevent recursion
+        if (useBootstrap()) {
+            return bootstrap::bootstrapAlloc.alloc(size);
+        }
+        InitGuard guard;
+        return getFancyGlobalAllocator().allocate(size);
+    }
+
+    void free(void* ptr) {
+        if (!ptr) return;
+        // Bootstrap allocations are leaked (bump allocator, no individual free)
+        if (bootstrap::bootstrapAlloc.owns(ptr)) return;
+        if (useBootstrap()) return;  // Can't free during init
+        InitGuard guard;
+        getFancyGlobalAllocator().deallocate(ptr);
+    }
+
+    void* realloc(void* ptr, size_t size) {
+        if (!ptr) return malloc(size);
+        if (size == 0) { free(ptr); return nullptr; }
+        // Bootstrap allocations: just allocate new
+        if (bootstrap::bootstrapAlloc.owns(ptr)) {
+            return malloc(size);
+        }
+        if (useBootstrap()) {
+            return bootstrap::bootstrapAlloc.alloc(size);
+        }
+        InitGuard guard;
+        return getFancyGlobalAllocator().reallocate(ptr, size);
+    }
+
+    void* calloc(size_t nmemb, size_t size) {
+        size_t total = nmemb * size;
+        if (size != 0 && total / size != nmemb) return nullptr;  // Overflow
+        void* ptr = malloc(total);
+        if (ptr) memset(ptr, 0, total);
+        return ptr;
+    }
+
+    void* aligned_alloc(size_t alignment, size_t size) {
+        if (useBootstrap()) {
+            // Bootstrap bump allocator is 16-byte aligned
+            // For larger alignment, over-allocate and adjust
+            if (alignment <= 16) return bootstrap::bootstrapAlloc.alloc(size);
+            void* ptr = bootstrap::bootstrapAlloc.alloc(size + alignment);
+            if (!ptr) return nullptr;
+            return alignPointer(ptr, alignment);
+        }
+        InitGuard guard;
+        return getFancyGlobalAllocator().allocateAligned(size, alignment);
+    }
+
     int posix_memalign(void** memptr, size_t alignment, size_t size) {
-        return fancy_posix_memalign(memptr, alignment, size);
+        if (!memptr) return EINVAL;
+        if (!isPowerOfTwo(alignment) || alignment < sizeof(void*)) return EINVAL;
+        void* ptr = aligned_alloc(alignment, size);
+        if (!ptr) return ENOMEM;
+        *memptr = ptr;
+        return 0;
     }
-    void* memalign(size_t alignment, size_t size) { return fancy_aligned_alloc(alignment, size); }
-    void* valloc(size_t size) { return fancy_aligned_alloc(4096, size); }
+
+    void* memalign(size_t alignment, size_t size) { return aligned_alloc(alignment, size); }
+    void* valloc(size_t size) { return aligned_alloc(4096, size); }
     void* pvalloc(size_t size) {
-        size = (size + 4095) & ~4095ULL;  // Round up to page size
-        return fancy_aligned_alloc(4096, size);
+        size = (size + 4095) & ~4095ULL;
+        return aligned_alloc(4096, size);
     }
-    size_t malloc_usable_size(void* ptr) { return fancy_malloc_usable_size(ptr); }
+    size_t malloc_usable_size(void* ptr) {
+        if (bootstrap::bootstrapAlloc.owns(ptr)) return 0;
+        if (useBootstrap()) return 0;
+        InitGuard guard;
+        return getFancyGlobalAllocator().getAllocSize(ptr);
+    }
 }
 #endif // FANCY_REPLACE_MALLOC
 
